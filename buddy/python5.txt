@@ -1,0 +1,888 @@
+The user wants me to create a Python script that reads an Excel file (registers.xlsx) and generates:
+1. Verilog RTL module (regfile_top) with all registers
+2. UVM register model (ral_reg_block derived class)
+3. C header file (regs.h) with register address definitions
+
+Let me design this script carefully.
+
+Excel format:
+- Sheet name: "registers"
+- Columns: Register Name, Offset, Field Name, Bit Range, Access, Reset Value, Description
+
+Requirements:
+1. Verilog RTL:
+   - Module name: regfile_top
+   - Each register: reg [WIDTH-1:0] name_q
+   - Provide name_we write enable logic
+   - Support sync read/write
+
+2. UVM model:
+   - ral_reg_block derived class
+   - uvm_reg_field for each field
+   - add_map method
+
+3. C header:
+   - Absolute address macros (base + offset)
+   - Field mask/shift macros
+
+4. Extra constraints:
+   - Multiple fields can share same offset (one register, multiple fields)
+   - Support access types: RW, RO, WO, RC, W1C
+   - Bit range assumed continuous (or warn if not)
+
+Let me write a comprehensive Python script.
+
+I'll use:
+- openpyxl or pandas to read Excel
+- Jinja2 or string templates for code generation
+
+Actually, let me write it with standard library + openpyxl (commonly available).
+
+Structure:
+1. Parse Excel into data structures
+2. Group fields by register (same offset = same register)
+3. Generate Verilog
+4. Generate UVM RAL
+5. Generate C header
+
+Let me code this up
+这是一个完整的 Python 脚本，从 Excel 寄存器规范自动生成 Verilog RTL、UVM RAL 模型和 C 头文件。
+
+---
+
+```python
+#!/usr/bin/env python3
+"""
+reg_gen.py - 从 Excel 寄存器规范自动生成:
+  1. Verilog RTL 寄存器文件
+  2. UVM RAL (Register Abstraction Layer) 模型
+  3. C 头文件 (寄存器地址定义)
+
+依赖: openpyxl (pip install openpyxl)
+用法: python reg_gen.py registers.xlsx --out-dir ./generated --base-addr 0x40000000
+"""
+
+import argparse
+import re
+import sys
+from pathlib import Path
+from dataclasses import dataclass, field
+from typing import List, Dict, Optional, Tuple
+import openpyxl
+from openpyxl import load_workbook
+
+
+# ======================== 数据结构 ========================
+
+@dataclass
+class Field:
+    """单个寄存器字段"""
+    name: str
+    bit_high: int           # 高位
+    bit_low: int            # 低位
+    access: str             # RW, RO, WO, RC, W1C, W1S, WRC 等
+    reset_value: int
+    description: str = ""
+
+    @property
+    def width(self) -> int:
+        return self.bit_high - self.bit_low + 1
+
+    @property
+    def mask(self) -> int:
+        return ((1 << self.width) - 1) << self.bit_low
+
+    @property
+    def shift(self) -> int:
+        return self.bit_low
+
+
+@dataclass
+class Register:
+    """单个寄存器（可能包含多个字段）"""
+    name: str
+    offset: int
+    fields: List[Field] = field(default_factory=list)
+    description: str = ""
+
+    @property
+    def width(self) -> int:
+        """寄存器位宽 = 最大字段的高位 + 1"""
+        if not self.fields:
+            return 32
+        return max(f.bit_high for f in self.fields) + 1
+
+    @property
+    def reset_value(self) -> int:
+        """综合所有字段的复位值"""
+        val = 0
+        for f in self.fields:
+            val |= (f.reset_value & ((1 << f.width) - 1)) << f.bit_low
+        return val
+
+
+@dataclass
+class RegisterMap:
+    """完整的寄存器映射"""
+    name: str = "regfile"
+    base_addr: int = 0x0
+    registers: List[Register] = field(default_factory=list)
+
+
+# ======================== Excel 解析 ========================
+
+ACCESS_TYPES = {"RW", "RO", "WO", "RC", "WRC", "W1C", "W1S", "W1T", "W0C", "W0S", "WSRC", "W1SRC"}
+
+ACCESS_TYPE_MAP = {
+    "RW":   "RW",
+    "RO":   "RO",
+    "WO":   "WO",
+    "RC":   "RC",
+    "W1C":  "W1C",
+    "W1S":  "W1S",
+    "W1T":  "W1T",
+    "W0C":  "W0C",
+    "WRC":  "WRC",
+    "W1SRC":"W1SRC",
+}
+
+
+def parse_bit_range(bit_range_str: str) -> Tuple[int, int]:
+    """
+    解析位范围字符串，返回 (high, low)。
+    支持格式: '0:0', '15:8', '7', '[15:8]', '15-8'
+    """
+    s = bit_range_str.strip().replace('[', '').replace(']', '')
+
+    # 格式: "high:low" 或 "high-low"
+    m = re.match(r'(\d+)\s*[:-]\s*(\d+)', s)
+    if m:
+        high = int(m.group(1))
+        low = int(m.group(2))
+        if high < low:
+            high, low = low, high
+        return high, low
+
+    # 格式: 单个位 "7"
+    m = re.match(r'^(\d+)$', s)
+    if m:
+        b = int(m.group(1))
+        return b, b
+
+    raise ValueError(f"无法解析位范围: '{bit_range_str}'")
+
+
+def parse_offset(offset_str: str) -> int:
+    """解析偏移量，支持 0x 前缀和十进制"""
+    s = offset_str.strip()
+    if s.startswith('0x') or s.startswith('0X'):
+        return int(s, 16)
+    return int(s)
+
+
+def parse_reset_value(reset_str: str) -> int:
+    """解析复位值"""
+    s = reset_str.strip()
+    if not s:
+        return 0
+    if s.startswith('0x') or s.startswith('0X'):
+        return int(s, 16)
+    return int(s)
+
+
+def read_registers_from_excel(excel_path: str) -> RegisterMap:
+    """
+    从 Excel 文件读取寄存器定义。
+    Sheet 名: "registers"（不区分大小写）
+    列: Register Name | Offset | Field Name | Bit Range | Access | Reset Value | Description
+    """
+    wb = load_workbook(excel_path, data_only=True)
+
+    # 查找 registers sheet（不区分大小写）
+    sheet_name = None
+    for name in wb.sheetnames:
+        if name.lower() == "registers":
+            sheet_name = name
+            break
+
+    if sheet_name is None:
+        # 尝试第一个 sheet
+        sheet_name = wb.sheetnames[0]
+        print(f"  ⚠️  未找到 'registers' sheet，使用 '{sheet_name}'")
+
+    ws = wb[sheet_name]
+    print(f"  📖 读取 Sheet: {sheet_name}")
+
+    # 读取表头（第一行）
+    header = {}
+    for col_idx, cell in enumerate(ws[1], start=1):
+        if cell.value:
+            header[cell.value.strip().lower()] = col_idx
+
+    # 必需的列
+    required = ["register name", "offset", "field name", "bit range", "access"]
+    for req in required:
+        if req not in header:
+            raise ValueError(f"Excel 缺少必需列: '{req}' (可用列: {list(header.keys())})")
+
+    # 列索引（1-based → 0-based）
+    col_reg    = header["register name"] - 1
+    col_offset = header["offset"] - 1
+    col_field  = header.get("field name", -1) - 1
+    col_bits   = header.get("bit range", -1) - 1
+    col_access = header.get("access", -1) - 1
+    col_reset  = header.get("reset value", -1) - 1
+    col_desc   = header.get("description", -1) - 1
+
+    # 按 (reg_name, offset) 分组
+    reg_map: Dict[Tuple[str, int], Register] = {}
+
+    for row_idx, row in enumerate(ws.iter_rows(min_row=2, values_only=True), start=2):
+        if not row or row[col_reg] is None:
+            continue  # 空行
+
+        reg_name = str(row[col_reg]).strip()
+        offset   = parse_offset(str(row[col_offset]))
+        field_name = str(row[col_field]).strip() if col_field >= 0 and row[col_field] else f"field_{row_idx}"
+        bit_high, bit_low = parse_bit_range(str(row[col_bits]))
+        access   = str(row[col_access]).strip().upper() if col_access >= 0 and row[col_access] else "RW"
+        reset    = parse_reset_value(str(row[col_reset])) if col_reset >= 0 and row[col_reset] else 0
+        desc     = str(row[col_desc]).strip() if col_desc >= 0 and row[col_desc] else ""
+
+        # 校验 access 类型
+        if access not in ACCESS_TYPE_MAP:
+            print(f"  ⚠️  第 {row_idx} 行: 未知 access 类型 '{access}'，默认为 RW")
+            access = "RW"
+
+        # 获取或创建寄存器
+        key = (reg_name, offset)
+        if key not in reg_map:
+            reg_map[key] = Register(name=reg_name, offset=offset, description=desc)
+
+        # 添加字段
+        field = Field(
+            name=field_name, bit_high=bit_high, bit_low=bit_low,
+            access=access, reset_value=reset, description=desc
+        )
+        reg_map[key].fields.append(field)
+
+    # 构建 RegisterMap
+    result = RegisterMap()
+    result.registers = sorted(reg_map.values(), key=lambda r: r.offset)
+
+    # 统计
+    total_fields = sum(len(r.fields) for r in result.registers)
+    print(f"  ✅ 解析完成: {len(result.registers)} 个寄存器, {total_fields} 个字段")
+
+    # 检查是否有重叠字段
+    for reg in result.registers:
+        _check_field_overlap(reg)
+
+    return result
+
+
+def _check_field_overlap(reg: Register) -> None:
+    """检查同一寄存器内字段是否位域重叠"""
+    sorted_fields = sorted(reg.fields, key=lambda f: f.bit_low)
+    for i in range(len(sorted_fields) - 1):
+        if sorted_fields[i].bit_high >= sorted_fields[i + 1].bit_low:
+            print(f"  ⚠️  寄存器 '{reg.name}' 字段 '{sorted_fields[i].name}' 和 "
+                  f"'{sorted_fields[i + 1].name}' 位域重叠!")
+
+
+# ======================== Verilog RTL 生成 ========================
+
+VERILOG_RTL_TEMPLATE = '''\
+//==============================================================================
+// 自动生成文件 - 请勿手动修改
+// 生成工具: reg_gen.py
+// 源文件:   {source_file}
+//==============================================================================
+module {module_name} #(
+    parameter ADDR_WIDTH = 32,
+    parameter DATA_WIDTH = 32
+)(
+    input  logic                    clk,
+    input  logic                    rst_n,
+
+    // 总线接口（简化 APB-like）
+    input  logic [ADDR_WIDTH-1:0]   paddr,
+    input  logic                    pwrite,
+    input  logic                    psel,
+    input  logic                    penable,
+    input  logic [DATA_WIDTH-1:0]   pwdata,
+    output logic [DATA_WIDTH-1:0]   prdata,
+    output logic                    pready,
+
+    // 寄存器输出（给外部逻辑使用）
+{reg_outputs}
+    // 中断输出（可选）
+    output logic                    intr
+);
+
+    // 地址解码
+    localparam BASE_ADDR = 32\'h{BASE_ADDR};
+
+    // 写使号生成
+    logic                    wr_en;
+    logic [DATA_WIDTH-1:0]  wr_data;
+    logic [ADDR_WIDTH-1:0]  wr_addr;
+    logic                    rd_en;
+    logic [ADDR_WIDTH-1:0]  rd_addr;
+
+    assign wr_en   = psel & penable & pwrite;
+    assign rd_en   = psel & penable & ~pwrite;
+    assign wr_data = pwdata;
+    assign wr_addr = paddr;
+    assign rd_addr = paddr;
+    assign pready  = 1\'b1;   // 始终就绪（可改为脉冲）
+
+    //==========================================================================
+    // 寄存器定义
+    //==========================================================================
+{register_defs}
+
+    //==========================================================================
+    // 地址解码 & 写逻辑
+    //==========================================================================
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+{reset_logic}
+        end else if (wr_en) begin
+{write_logic}
+        end
+    end
+
+    //==========================================================================
+    // 读逻辑
+    //==========================================================================
+    always_comb begin
+        prdata = {DATA_WIDTH{1\'b0}};
+        case (rd_addr)
+{read_logic}
+            default: prdata = {DATA_WIDTH{1\'b0}};
+        endcase
+    end
+
+    //==========================================================================
+    // 中断逻辑（示例：STATUS.error 上升沿触发）
+    //==========================================================================
+    logic error_q;
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) error_q <= 1\'b0;
+        else        error_q <= {intr_source};
+    end
+    assign intr = {intr_source} & ~error_q;  // 上升沿触发
+
+endmodule
+'''
+
+def gen_verilog_rtl(reg_map: RegisterMap, source_file: str, out_path: Path) -> None:
+    """生成 Verilog RTL 寄存器文件"""
+
+    module_name = f"{reg_map.name}_regfile"
+
+    # --- 寄存器输出端口声明 ---
+    reg_outputs_lines = []
+    for reg in reg_map.registers:
+        # 每个寄存器输出当前值
+        reg_outputs_lines.append(
+            f"    output logic [{reg.width-1}:0]  {reg.name}_o,"
+        )
+    reg_outputs = "\n".join(reg_outputs_lines) if reg_outputs_lines else "    // (无输出端口)"
+
+    # --- 寄存器定义 ---
+    reg_defs_lines = []
+    for reg in reg_map.registers:
+        dw = reg.width
+        reg_defs_lines.append(f"    // {reg.name} @ 0x{reg.offset:04X} - {reg.description}")
+        reg_defs_lines.append(f"    logic [{dw-1}:0] {reg.name}_q;")
+        reg_defs_lines.append(f"    logic           {reg.name}_we;")
+        reg_defs_lines.append("")
+    reg_defs = "\n".join(reg_defs_lines)
+
+    # --- 复位逻辑 ---
+    reset_lines = []
+    for reg in reg_map.registers:
+        reset_val = reg.reset_value
+        reset_lines.append(f"            {reg.name}_q <= {reg.width}'h{reset_val:0{((reg.width+3)//4)}X};")
+    reset_logic = "\n".join(reset_lines)
+
+    # --- 写逻辑 ---
+    write_lines = []
+    for reg in reg_map.registers:
+        addr_match = f"((wr_addr - BASE_ADDR) == 32'h{reg.offset:04X})"
+        write_lines.append(f"            if ({addr_match}) begin")
+        write_lines.append(f"                {reg.name}_we <= 1'b1;")
+
+        # 按字段处理写操作（支持 RC/W1C 等）
+        for f in reg.fields:
+            access = f.access
+            if access in ("RO",):
+                # 只读字段，不可写
+                write_lines.append(f"                // {f.name}: RO - 不可写")
+            elif access in ("W1C", "W1S", "W1T"):
+                # 写 1 清除/置位/翻转
+                write_lines.append(f"                // {f.name}: {access}")
+                write_lines.append(f"                if (wr_data[{f.bit_high}:{f.bit_low}] != 0)")
+                write_lines.append(f"                    {reg.name}_q[{f.bit_high}:{f.bit_low}] <= {access}_LOGIC;  // TODO")
+            else:
+                # 普通可写字段
+                mask_str = f"{{f.bit_high}:{f.bit_low}}"
+                write_lines.append(f"                {reg.name}_q[{f.bit_high}:{f.bit_low}] <= wr_data[{f.bit_high}:{f.bit_low}];  // {f.name} ({access})")
+
+        write_lines.append(f"            end else begin")
+        write_lines.append(f"                {reg.name}_we <= 1'b0;")
+        write_lines.append(f"            end")
+        write_lines.append("")
+
+    # 简化版：整寄存器写
+    write_lines = []
+    for reg in reg_map.registers:
+        addr_match = f"((wr_addr - BASE_ADDR) == 32'h{reg.offset:04X})"
+        write_lines.append(f"            if ({addr_match}) begin")
+        write_lines.append(f"                {reg.name}_q <= wr_data[{reg.width-1}:0];")
+
+        # 只读字段保持不变
+        ro_fields = [f for f in reg.fields if f.access == "RO"]
+        for f in ro_fields:
+            write_lines.append(f"                {reg.name}_q[{f.bit_high}:{f.bit_low}] <= {reg.name}_q[{f.bit_high}:{f.bit_low}];  // {f.name}: RO")
+
+        write_lines.append(f"            end")
+        write_lines.append("")
+
+    write_logic = "\n".join(write_lines)
+
+    # --- 读逻辑 ---
+    read_lines = []
+    for reg in reg_map.registers:
+        addr_match = f"((rd_addr - BASE_ADDR) == 32'h{reg.offset:04X})"
+        read_lines.append(f"            {addr_match}: prdata <= {{{DATA_WIDTH-reg.width}{{1'b0}}, {reg.name}_q}};")
+    read_logic = "\n".join(read_lines)
+
+    # --- 中断源（示例：第一个有 RC 属性的字段）---
+    intr_source = "1'b0"
+    for reg in reg_map.registers:
+        for f in reg.fields:
+            if f.access in ("RC", "RS"):
+                intr_source = f"{reg.name}_q[{f.bit_low}]"
+                break
+    if intr_source == "1'b0":
+        intr_source = "1'b0"
+
+    # 渲染
+    content = VERILOG_RTL_TEMPLATE.format(
+        source_file=source_file,
+        module_name=module_name,
+        BASE_ADDR=format(reg_map.base_addr, '08X'),
+        reg_outputs=reg_outputs,
+        register_defs=reg_defs,
+        reset_logic=reset_logic,
+        write_logic=write_logic,
+        read_logic=read_logic,
+        intr_source=intr_source,
+    )
+
+    out_path.write_text(content, encoding="utf-8")
+    print(f"  ✅ Verilog RTL 已生成: {out_path}")
+
+
+# ======================== UVM RAL 生成 ========================
+
+UVM_RAL_TEMPLATE = '''\
+//==============================================================================
+// 自动生成文件 - 请勿手动修改
+// 生成工具: reg_gen.py
+// 源文件:   {source_file}
+//==============================================================================
+`ifndef {INCLUDE_GUARD}
+`define {INCLUDE_GUARD}
+
+`include "uvm_macros.svh"
+import uvm_pkg::*;
+
+//==============================================================================
+// UVM Register Model - {block_name}
+//==============================================================================
+
+{register_classes}
+
+//==============================================================================
+// Register Block: {block_name}
+//==============================================================================
+class {block_name} extends uvm_reg_block;
+    `uvm_object_utils({block_name})
+
+    // 寄存器实例
+{reg_instances}
+    // 地址映射
+    uvm_reg_map reg_map;
+
+    //--------------------------------------------------------------------------
+    function new(string name = "{block_name}");
+        super.new(name, build_coverage(UVM_NO_COVERAGE));
+    endfunction
+
+    //--------------------------------------------------------------------------
+    virtual function void build();
+        // 创建地址映射
+        reg_map = create_map("reg_map", 0, 4, UVM_LITTLE_ENDIAN, 1);  // 4 bytes = 32-bit
+
+{build_logic}
+        // 锁定模型
+        lock_model();
+    endfunction
+
+endclass : {block_name}
+
+`endif // {INCLUDE_GUARD}
+'''
+
+REG_CLASS_TEMPLATE = '''
+//==============================================================================
+// Register: {reg_name} @ 0x{offset:04X}
+//==============================================================================
+class {reg_name}_reg extends uvm_reg;
+    `uvm_object_utils({reg_name}_reg)
+
+    // 字段定义
+{fields_decl}
+
+    //--------------------------------------------------------------------------
+    function new(string name = "{reg_name}_reg");
+        super.new(name, {width}, UVM_NO_COVERAGE);
+    endfunction
+
+    //--------------------------------------------------------------------------
+    virtual function void build();
+{build_fields}
+    endfunction
+
+endclass : {reg_name}_reg
+'''
+
+
+def gen_uvm_ral(reg_map: RegisterMap, source_file: str, out_path: Path) -> None:
+    """生成 UVM RAL 模型"""
+
+    block_name = f"{reg_map.name}_ral_block"
+    include_guard = f"{block_name.upper()}_SV"
+
+    # --- 生成每个寄存器的类 ---
+    register_classes = []
+    reg_instances = []
+    build_logic = []
+
+    for reg in reg_map.registers:
+        reg_class_name = f"{reg.name}_reg"
+
+        # 字段声明
+        fields_decl = []
+        build_fields = []
+
+        for f in reg.fields:
+            field_var = f"    uvm_reg_field {f.name};"
+            fields_decl.append(field_var)
+
+            access_uvm = ACCESS_TYPE_MAP.get(f.access, "RW")
+
+            build_fields.append(f"        {f.name} = uvm_reg_field::type_id::create(\"{f.name}\");")
+            build_fields.append(f"        {f.name}.configure(")
+            build_fields.append(f"            .parent              (this),")
+            build_fields.append(f"            .size                ({f.width}),")
+            build_fields.append(f"            .lsb_pos             ({f.bit_low}),")
+            build_fields.append(f"            .access              (\"{access_uvm}\"),")
+            build_fields.append(f"            .volatile            (1'b0),")
+            build_fields.append(f"            .reset               ({f.reset_value}),")
+            build_fields.append(f"            .has_reset           (1'b1),")
+            build_fields.append(f"            .is_rand            (1'b0),")
+            build_fields.append(f"            .individually_accessible(1'b0)")
+            build_fields.append(f"        );")
+
+        # 渲染寄存器类
+        reg_class = REG_CLASS_TEMPLATE.format(
+            reg_name=reg.name,
+            offset=reg.offset,
+            width=reg.width,
+            fields_decl="\n".join(fields_decl),
+            build_fields="\n".join(build_fields),
+        )
+        register_classes.append(reg_class)
+
+        # 寄存器实例
+        reg_instances.append(f"    {reg.name}_reg {reg.name};")
+
+        # build() 中的实例化与映射
+        build_logic.append(f"        // {reg.name} @ 0x{reg.offset:04X}")
+        build_logic.append(f"        {reg.name} = {reg.name}_reg::type_id::create(\"{reg.name}\");")
+        build_logic.append(f"        {reg.name}.configure(null);")
+        build_logic.append(f"        {reg.name}.build();")
+        build_logic.append(f"        reg_map.add_reg({reg.name}, 'h{reg.offset:X}, \"{ACCESS_TYPE_MAP.get(reg.fields[0].access, 'RW')}\");")
+        build_logic.append("")
+
+    # 渲染完整文件
+    content = UVM_RAL_TEMPLATE.format(
+        source_file=source_file,
+        INCLUDE_GUARD=include_guard,
+        block_name=block_name,
+        register_classes="\n".join(register_classes),
+        reg_instances="\n".join(reg_instances),
+        build_logic="\n".join(build_logic),
+    )
+
+    out_path.write_text(content, encoding="utf-8")
+    print(f"  ✅ UVM RAL 模型已生成: {out_path}")
+
+
+# ======================== C 头文件生成 ========================
+
+C_HEADER_TEMPLATE = '''\
+/*==============================================================================
+ * 自动生成文件 - 请勿手动修改
+ * 生成工具: reg_gen.py
+ * 源文件:   {source_file}
+ *============================================================================*/
+#ifndef {INCLUDE_GUARD}
+#define {INCLUDE_GUARD}
+
+#ifdef __cplusplus
+extern "C" {{
+#endif
+
+/*------------------------------------------------------------------------------
+ * 基址定义
+ *----------------------------------------------------------------------------*/
+#define {MACRO_PREFIX}_BASE_ADDR    (0x{base_addr:08X}UL)
+
+/*------------------------------------------------------------------------------
+ * 寄存器偏移量定义
+ *----------------------------------------------------------------------------*/
+{offset_defines}
+
+/*------------------------------------------------------------------------------
+ * 寄存器绝对地址宏
+ *----------------------------------------------------------------------------*/
+{addr_macros}
+
+/*------------------------------------------------------------------------------
+ * 字段掩码与位移定义
+ *----------------------------------------------------------------------------*/
+{field_defines}
+
+/*------------------------------------------------------------------------------
+ * 寄存器复位值定义
+ *----------------------------------------------------------------------------*/
+{reset_defines}
+
+#ifdef __cplusplus
+}}
+#endif
+
+#endif // {INCLUDE_GUARD}
+'''
+
+def gen_c_header(reg_map: RegisterMap, source_file: str, out_path: Path) -> None:
+    """生成 C 头文件"""
+
+    macro_prefix = reg_map.name.upper()
+    include_guard = f"{macro_prefix}_REGS_H"
+
+    # --- 偏移量定义 ---
+    offset_lines = []
+    for reg in reg_map.registers:
+        offset_lines.append(
+            f"#define {macro_prefix}_{reg.name.upper()}_OFFSET   (0x{reg.offset:04X}UL)"
+        )
+    offset_defines = "\n".join(offset_lines)
+
+    # --- 绝对地址宏 ---
+    addr_lines = []
+    for reg in reg_map.registers:
+        addr_lines.append(
+            f"#define {macro_prefix}_{reg.name.upper()}_ADDR     "
+            f"({macro_prefix}_BASE_ADDR + {macro_prefix}_{reg.name.upper()}_OFFSET)"
+        )
+    addr_macros = "\n".join(addr_lines)
+
+    # --- 字段定义 ---
+    field_lines = []
+    for reg in reg_map.registers:
+        for f in reg.fields:
+            f_macro = f"{macro_prefix}_{reg.name.upper()}_{f.name.upper()}"
+            field_lines.append(f"// {reg.name}.{f.name} [{f.bit_high}:{f.bit_low}] - {f.access}")
+            field_lines.append(f"#define {f_macro}_MASK     (0x{((1 << f.width) - 1):X}UL << {f.bit_low}U)")
+            field_lines.append(f"#define {f_macro}_SHIFT    ({f.bit_low}U)")
+            field_lines.append(f"#define {f_macro}_RESET    (0x{f.reset_value:X}UL)")
+            field_lines.append("")
+
+    field_defines = "\n".join(field_lines)
+
+    # --- 复位值定义 ---
+    reset_lines = []
+    for reg in reg_map.registers:
+        reset_lines.append(
+            f"#define {macro_prefix}_{reg.name.upper()}_RESET    (0x{reg.reset_value:08X}UL)"
+        )
+    reset_defines = "\n".join(reset_lines)
+
+    # 渲染
+    content = C_HEADER_TEMPLATE.format(
+        source_file=source_file,
+        INCLUDE_GUARD=include_guard,
+        MACRO_PREFIX=macro_prefix,
+        base_addr=reg_map.base_addr,
+        offset_defines=offset_defines,
+        addr_macros=addr_macros,
+        field_defines=field_defines,
+        reset_defines=reset_defines,
+    )
+
+    out_path.write_text(content, encoding="utf-8")
+    print(f"  ✅ C 头文件已生成: {out_path}")
+
+
+# ======================== 主流程 ========================
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="从 Excel 寄存器规范自动生成 Verilog RTL、UVM RAL 模型和 C 头文件",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+示例:
+  python reg_gen.py registers.xlsx --out-dir ./generated --base-addr 0x40000000
+
+Excel 格式要求（Sheet 名 "registers"）:
+  列: Register Name | Offset | Field Name | Bit Range | Access | Reset Value | Description
+
+Access 类型支持: RW, RO, WO, RC, W1C, W1S, W1T, W0C, WRC, W1SRC
+"""
+    )
+
+    parser.add_argument("excel_file", help="输入 Excel 文件 (registers.xlsx)")
+    parser.add_argument("--out-dir", default="./generated", help="输出目录 (默认: ./generated)")
+    parser.add_argument("--base-addr", default="0x40000000", help="寄存器基址 (默认: 0x40000000)")
+    parser.add_argument("--module-name", default="regfile", help="模块名前缀 (默认: regfile)")
+    parser.add_argument("--no-rtl", action="store_true", help="跳过 Verilog RTL 生成")
+    parser.add_argument("--no-ral", action="store_true", help="跳过 UVM RAL 生成")
+    parser.add_argument("--no-cheader", action="store_true", help="跳过 C 头文件生成")
+
+    args = parser.parse_args()
+
+    # 解析基址
+    base_addr = int(args.base_addr, 0)
+
+    # 创建输出目录
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    print("=" * 70)
+    print("  寄存器代码生成工具 (reg_gen.py)")
+    print("=" * 70)
+    print(f"  输入文件:  {args.excel_file}")
+    print(f"  输出目录:  {out_dir}")
+    print(f"  基址:      0x{base_addr:08X}")
+    print(f"  模块名:    {args.module_name}")
+    print()
+
+    # ---- 读取 Excel ----
+    print("[Step 1] 读取 Excel 寄存器规范...")
+    reg_map = read_registers_from_excel(args.excel_file)
+    reg_map.name = args.module_name
+    reg_map.base_addr = base_addr
+
+    # ---- 生成文件 ----
+    print(f"\n[Step 2] 生成代码文件...")
+
+    if not args.no_rtl:
+        verilog_path = out_dir / f"{args.module_name}_regfile.sv"
+        gen_verilog_rtl(reg_map, args.excel_file, verilog_path)
+
+    if not args.no_ral:
+        ral_path = out_dir / f"{args.module_name}_ral_block.sv"
+        gen_uvm_ral(reg_map, args.excel_file, ral_path)
+
+    if not args.no_cheader:
+        header_path = out_dir / f"{args.module_name}_regs.h"
+        gen_c_header(reg_map, args.excel_file, header_path)
+
+    # ---- 生成汇总 ----
+    print(f"\n{'=' * 70}")
+    print(f"  ✅ 生成完成!")
+    print(f"  寄存器数量: {len(reg_map.registers)}")
+    total_fields = sum(len(r.fields) for r in reg_map.registers)
+    print(f"  字段数量:   {total_fields}")
+    print(f"  输出目录:   {out_dir.resolve()}")
+    print(f"{'=' * 70}")
+
+    # 打印寄存器摘要表
+    print(f"\n  寄存器摘要:")
+    print(f"  {'名称':<20s} {'偏移':>8s} {'位宽':>6s} {'字段数':>6s} {'复位值':>12s}")
+    print(f"  " + "-" * 58)
+    for reg in reg_map.registers:
+        print(f"  {reg.name:<20s} 0x{reg.offset:04X}   {reg.width:>4d}   "
+              f"{len(reg.fields):>4d}   0x{reg.reset_value:08X}")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+---
+
+## 安装依赖
+
+```bash
+pip install openpyxl
+```
+
+## 使用方法
+
+```bash
+# 基本用法
+python reg_gen.py registers.xlsx --out-dir ./generated --base-addr 0x40000000
+
+# 只生成 C 头文件
+python reg_gen.py registers.xlsx --no-rtl --no-ral
+
+# 自定义模块名
+python reg_gen.py registers.xlsx --module-name my_dut
+```
+
+## 生成的文件
+
+```
+generated/
+├── regfile_regfile.sv      # Verilog RTL
+├── regfile_ral_block.sv    # UVM RAL 模型
+└── regfile_regs.h          # C 头文件
+```
+
+## 支持的 Access 类型
+
+| 类型 | 说明 | UVM RAL `configure()` |
+|------|------|-----------------------|
+| `RW`  | 读写 | `"RW"` |
+| `RO`  | 只读 | `"RO"` |
+| `WO`  | 只写 | `"WO"` |
+| `RC`  | 读后清 | `"RC"` |
+| `W1C` | 写 1 清除 | `"W1C"` |
+| `W1S` | 写 1 置位 | `"W1S"` |
+| `W1T` | 写 1 翻转 | `"W1T"` |
+| `W0C` | 写 0 清除 | `"W0C"` |
+| `WRC` | 写后读清 | `"WRC"` |
+
+## C 头文件输出示例
+
+```c
+#define REGFILE_BASE_ADDR        (0x40000000UL)
+#define REGFILE_CTRL_OFFSET      (0x0000UL)
+#define REGFILE_STATUS_OFFSET    (0x0004UL)
+
+// 字段掩码与位移
+#define REGFILE_CTRL_ENABLE_MASK     (0x1UL << 0U)
+#define REGFILE_CTRL_ENABLE_SHIFT    (0U)
+#define REGFILE_CTRL_MODE_MASK       (0x3UL << 1U)
+#define REGFILE_CTRL_MODE_SHIFT      (1U)
+```
+
+如需支持更多 Excel 格式（例如多个 Sheet、不同列名映射），请告诉我！

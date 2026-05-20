@@ -1,0 +1,209 @@
+pipeline {
+    agent any
+
+    parameters {
+        // 手动触发时可输入自定义测试用例列表，每行 "test_name,seed"
+        // 若留空，则使用仓库中的 testlist.csv
+        text(
+            name: 'TESTCASES',
+            defaultValue: '',
+            description: '自定义测试用例列表（每行格式：test_name,seed），留空则使用 testlist.csv'
+        )
+    }
+
+    triggers {
+        // 每分钟轮询一次，模拟 push 触发（实际生产建议使用 GitHub webhook 或更合理的轮询频率）
+        pollSCM('* * * * *')
+    }
+
+    environment {
+        // 若有公共的环境变量可在此定义
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+            }
+        }
+
+        stage('Prepare Test List') {
+            steps {
+                script {
+                    // 如果手动提供了测试用例，则覆盖 testlist.csv
+                    if (params.TESTCASES?.trim()) {
+                        writeFile file: 'testlist.csv', text: params.TESTCASES
+                    } else {
+                        if (!fileExists('testlist.csv')) {
+                            error('未提供自定义测试用例，且仓库中不存在 testlist.csv 文件')
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Run Simulations in Parallel') {
+            steps {
+                script {
+                    // 解析测试列表
+                    def lines = readFile('testlist.csv').readLines()*.trim().findAll { it }
+                    def tests = lines.collect { line ->
+                        def parts = line.split(',')
+                        [test_name: parts[0].trim(), seed: parts[1].trim()]
+                    }
+                    if (tests.isEmpty()) {
+                        error('测试列表为空，无法执行仿真')
+                    }
+
+                    // 构建并行任务映射
+                    def parallelStages = [:]
+                    tests.each { test ->
+                        def testName = test.test_name
+                        def seed = test.seed
+                        def stageName = "${testName}_${seed}"
+
+                        parallelStages[stageName] = {
+                            // 所有任务在当前节点执行，共享工作区
+                            def startTime = System.currentTimeMillis()
+                            def result = "PASS"
+                            try {
+                                // 超时控制：30 分钟
+                                timeout(time: 30, unit: 'MINUTES') {
+                                    // 调用仿真命令，确保 run_sim.sh 可执行
+                                    sh """
+                                        chmod +x run_sim.sh
+                                        ./run_sim.sh ${testName} ${seed} > sim_${testName}_${seed}.log 2>&1
+                                    """
+                                }
+                            } catch (err) {
+                                // 超时或其他异常标记为 FAIL
+                                result = "FAIL"
+                            }
+                            def endTime = System.currentTimeMillis()
+                            def durationSec = (endTime - startTime) / 1000.0
+
+                            // 检查日志中的 UVM_ERROR 或 FATAL
+                            def logFile = "sim_${testName}_${seed}.log"
+                            if (fileExists(logFile)) {
+                                def logContent = readFile(logFile)
+                                if (logContent.contains('UVM_ERROR') || logContent.contains('FATAL')) {
+                                    result = "FAIL"
+                                }
+                            } else {
+                                result = "FAIL"
+                            }
+
+                            // 将单个结果写入临时 JSON 文件
+                            def jsonContent = groovy.json.JsonOutput.toJson([
+                                test        : testName,
+                                seed        : seed,
+                                result      : result,
+                                duration_sec: durationSec
+                            ])
+                            writeFile file: "result_${testName}_${seed}.json", text: jsonContent
+                        }
+                    }
+
+                    // 并行执行所有任务
+                    parallel parallelStages
+
+                    // 所有任务结束后，合并临时结果文件为 results.json
+                    sh '''
+                        echo '[' > results.json
+                        first=true
+                        for f in result_*.json; do
+                            if [ "$first" = true ]; then
+                                first=false
+                            else
+                                echo ',' >> results.json
+                            fi
+                            cat "$f" >> results.json
+                        done
+                        echo ']' >> results.json
+                        rm -f result_*.json
+                    '''
+                }
+            }
+        }
+
+        stage('Merge Coverage and Report') {
+            steps {
+                script {
+                    // 查找所有生成的 .vdb 文件并传递给合并脚本
+                    sh '''
+                        vdb_files=$(find . -maxdepth 1 -name "*.vdb")
+                        if [ -n "$vdb_files" ]; then
+                            python merge_coverage.py $vdb_files -o cov_report
+                        else
+                            echo "No coverage databases found, skipping merge."
+                            mkdir -p cov_report
+                            echo "<html><body>No coverage data</body></html>" > cov_report/index.html
+                        fi
+                    '''
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            // 归档产物
+            archiveArtifacts artifacts: 'results.json, cov_report/**', allowEmptyArchive: true
+
+            script {
+                // 读取汇总结果并生成 HTML 表格
+                def results = []
+                if (fileExists('results.json')) {
+                    results = readJSON file: 'results.json'
+                }
+                def tableRows = ''
+                results.each { r ->
+                    tableRows += """
+                        <tr>
+                            <td>${r.test}</td>
+                            <td>${r.seed}</td>
+                            <td style="color:${r.result == 'PASS' ? 'green' : 'red'}">${r.result}</td>
+                            <td>${String.format('%.2f', r.duration_sec)} s</td>
+                        </tr>
+                    """
+                }
+                def summaryTable = """
+                    <table border="1" cellpadding="5" cellspacing="0">
+                        <tr><th>Test Name</th><th>Seed</th><th>Result</th><th>Duration (s)</th></tr>
+                        ${tableRows}
+                    </table>
+                """
+
+                // 覆盖率报告链接
+                def coverageLink = "${env.BUILD_URL}artifact/cov_report/index.html"
+
+                // 发送邮件（需安装 Email Extension 插件）
+                emailext(
+                    subject: "[${currentBuild.result}] Pipeline ${env.JOB_NAME} - Build #${env.BUILD_NUMBER}",
+                    body: """
+                        <h3>仿真结果汇总</h3>
+                        ${summaryTable}
+                        <p>覆盖率报告：<a href="${coverageLink}">点击查看</a></p>
+                        <p>构建详情：<a href="${env.BUILD_URL}">${env.BUILD_URL}</a></p>
+                    """,
+                    to: 'team-list@example.com',
+                    mimeType: 'text/html'
+                )
+            }
+        }
+    }
+}
+
+关键设计说明
+触发方式：pollSCM('* * * * *') 模拟 push 触发；parameters 提供手动触发时自定义用例的能力。
+
+并行执行与共享工作区：所有仿真任务在同一个 agent 节点上并行运行，确保日志与覆盖率数据库可直接收集，无需 stash/unstash。
+
+超时与异常处理：每个任务包裹在 timeout(30, 'MINUTES') 内，超时或异常均标记为 FAIL。
+
+结果解析：每任务独立生成临时 JSON，最终合并为 results.json。
+
+覆盖率合并：使用 find 收集所有 .vdb 并调用 merge_coverage.py，若没有数据库则生成占位报告。
+
+邮件报告：包含测试结果表格（含运行时间）和覆盖率报告链接，使用 HTML 格式。
+

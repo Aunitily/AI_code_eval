@@ -1,0 +1,121 @@
+#!/usr/bin/env python3
+import argparse
+import subprocess
+import sys
+import os
+import re
+from datetime import datetime
+
+def run_step(step_name, cmd, log_filename):
+    """执行命令并返回日志文件路径，若命令执行异常则抛出异常。"""
+    print(f"[INFO] 开始执行 {step_name} ...")
+    print(f"[CMD] {' '.join(cmd)}")
+    try:
+        # 执行命令，将输出重定向到 log 文件
+        with open(log_filename, 'w') as log_file:
+            proc = subprocess.run(cmd, stdout=log_file, stderr=subprocess.STDOUT, text=True)
+        # 检查返回码（非必须，但记录）
+        if proc.returncode != 0:
+            print(f"[WARNING] {step_name} 命令返回非零退出码: {proc.returncode}")
+    except Exception as e:
+        print(f"[ERROR] 执行 {step_name} 失败: {e}")
+        sys.exit(1)
+
+    print(f"[INFO] {step_name} 执行完成，日志已保存至 {log_filename}")
+    return log_filename
+
+def check_log_for_errors(log_file, step_name):
+    """检查日志文件中是否存在 ERROR 关键字（不区分大小写），返回是否发现错误。"""
+    if not os.path.exists(log_file):
+        print(f"[ERROR] 日志文件 {log_file} 不存在，无法检查错误。")
+        return True  # 视为错误，终止流程
+    error_pattern = re.compile(r'error', re.IGNORECASE)
+    with open(log_file, 'r') as f:
+        for line in f:
+            if error_pattern.search(line):
+                print(f"[ERROR] 在 {step_name} 日志中发现错误: {line.strip()}")
+                return True
+    return False
+
+def archive_log(step_name, log_filename):
+    """将日志文件移动到 ./logs/ 目录并重命名为 {步骤名}_{时间戳}.log，返回新路径。"""
+    logs_dir = "./logs"
+    os.makedirs(logs_dir, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    new_name = f"{step_name}_{timestamp}.log"
+    new_path = os.path.join(logs_dir, new_name)
+    os.rename(log_filename, new_path)
+    print(f"[INFO] 日志已归档为 {new_path}")
+    return new_path
+
+def main():
+    parser = argparse.ArgumentParser(description="数字前端自动化流程：Lint -> 综合 -> 仿真")
+    parser.add_argument("--top", required=True, help="顶层模块名")
+    parser.add_argument("--rtl_list", required=True, help="RTL 文件列表（文本文件，每行一个路径）")
+    parser.add_argument("--syn", action="store_true", default=False, help="是否执行综合")
+    parser.add_argument("--sim", action="store_true", default=False, help="是否执行仿真")
+    args = parser.parse_args()
+
+    top = args.top
+    rtl_list = args.rtl_list
+
+    # 定义步骤顺序：Lint 始终执行
+    steps = []
+    # Lint
+    steps.append({
+        "name": "lint",
+        "enabled": True,
+        "cmd": ["spyglass", "-run", "lint", "-top", top, "-filelist", rtl_list, "-log", "lint.log"],
+        "log_file": "lint.log"
+    })
+
+    if args.syn:
+        steps.append({
+            "name": "syn",
+            "enabled": True,
+            "cmd": ["dc_shell", "-f", "run_synthesis.tcl", "-top", top, "-rtl_list", rtl_list, "-log", "syn.log"],
+            "log_file": "syn.log"
+        })
+    if args.sim:
+        steps.append({
+            "name": "sim",
+            "enabled": True,
+            # vcs 命令中的 -f 用于指定 RTL 文件列表，+define+SIM 定义宏
+            "cmd": ["vcs", "-f", rtl_list, "-top", top, "+define+SIM", "-l", "sim.log"],
+            "log_file": "sim.log"
+        })
+
+    # 依次执行各个步骤
+    for step in steps:
+        if not step["enabled"]:
+            continue
+        step_name = step["name"]
+        log_file = step["log_file"]
+        cmd = step["cmd"]
+
+        # 执行步骤
+        run_step(step_name, cmd, log_file)
+
+        # 将日志归档至 logs 目录
+        archived_log = archive_log(step_name, log_file)
+
+        # 检查日志中是否有 ERROR
+        if check_log_for_errors(archived_log, step_name):
+            print(f"[ERROR] {step_name} 执行失败，终止后续流程。")
+            sys.exit(1)
+
+    print("[INFO] 所有步骤执行成功。")
+    sys.exit(0)
+
+if __name__ == "__main__":
+    main()
+	
+使用方式
+bash
+python run_flow.py --top top_module --rtl_list rtl.f --syn --sim
+不带 --syn 或 --sim 时，对应步骤跳过。
+
+所有日志最终位于 ./logs/ 下，命名如 lint_20260427_153045.log。
+
+若任一日志包含 error（忽略大小写），脚本立即终止并返回非 0 退出码，同时已生成的日志也会被妥善归档。
+

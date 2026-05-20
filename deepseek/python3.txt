@@ -1,0 +1,125 @@
+#!/usr/bin/env python3
+"""
+解析仿真日志，提取多个测试用例的结构化信息。
+支持 VCS (Simulation PASSED/FAILED) 和 Xcelium (TEST PASSED/FAILED)。
+"""
+import re
+import json
+import argparse
+from typing import List, Dict, Any
+
+# 匹配一个测试用例块中的关键信息
+RE_TEST = re.compile(r'^Test:\s*(\S+)', re.MULTILINE)
+RE_SEED = re.compile(r'^Seed:\s*(\d+)', re.MULTILINE)
+RE_START_TIME = re.compile(r'^Start time:\s*(.+)', re.MULTILINE)
+RE_SUMMARY = re.compile(r'^Summary:\s*(\d+)\s*error,\s*(\d+)\s*warning,\s*\d+\s*fatal',
+                        re.MULTILINE | re.IGNORECASE)
+RE_RESULT = re.compile(r'(?:Simulation|TEST)\s+(PASSED|FAILED)', re.IGNORECASE)
+RE_ELAPSED = re.compile(r'^Elapsed time:\s*([\d.]+)\s*(?:seconds?|s)',
+                        re.MULTILINE | re.IGNORECASE)
+
+def parse_sim_log(log_path: str) -> List[Dict[str, Any]]:
+    """
+    解析仿真日志文件。
+
+    Args:
+        log_path: 日志文件路径
+
+    Returns:
+        一个字典列表，每个字典包含:
+            test_name: str
+            seed: str
+            start_time: str
+            error_count: int
+            warning_count: int
+            result: str          # "PASS" 或 "FAIL"
+            elapsed_time_sec: float
+    """
+    with open(log_path, 'r') as f:
+        content = f.read()
+
+    # 按连续等号行分割多个测试用例块
+    blocks = re.split(r'^=+\s*$', content, flags=re.MULTILINE)
+    # 过滤空块（去除 strip 后为空白的块）
+    blocks = [b.strip() for b in blocks if b.strip()]
+
+    results = []
+    for block in blocks:
+        # 提取各字段
+        m_test = RE_TEST.search(block)
+        m_seed = RE_SEED.search(block)
+        m_start = RE_START_TIME.search(block)
+        m_summary = RE_SUMMARY.search(block)
+        m_result = RE_RESULT.search(block)
+        m_elapsed = RE_ELAPSED.search(block)
+
+        test_name = m_test.group(1) if m_test else None
+        seed = m_seed.group(1) if m_seed else None
+        start_time = m_start.group(1).strip() if m_start else None
+
+        if m_summary:
+            error_count = int(m_summary.group(1))
+            warning_count = int(m_summary.group(2))
+        else:
+            # 若无 Summary 行，则手动统计 UVM_ERROR 和 UVM_WARNING
+            errors_in_block = len(re.findall(r'\bUVM_ERROR\b', block, re.IGNORECASE))
+            warnings_in_block = len(re.findall(r'\bUVM_WARNING\b', block, re.IGNORECASE))
+            error_count = errors_in_block
+            warning_count = warnings_in_block
+
+        # 结果判定
+        if m_result:
+            result = "PASS" if m_result.group(1).upper() == "PASSED" else "FAIL"
+        else:
+            result = "FAIL" if error_count > 0 else "PASS"
+
+        # 耗时
+        elapsed = None
+        if m_elapsed:
+            try:
+                elapsed = float(m_elapsed.group(1))
+            except ValueError:
+                pass
+
+        results.append({
+            "test_name": test_name,
+            "seed": seed,
+            "start_time": start_time,
+            "error_count": error_count,
+            "warning_count": warning_count,
+            "result": result,
+            "elapsed_time_sec": elapsed
+        })
+
+    return results
+
+def main():
+    parser = argparse.ArgumentParser(description="解析仿真日志，输出结构化JSON")
+    parser.add_argument("log_path", help="仿真日志文件路径")
+    parser.add_argument("-o", "--output", default="parsed_results.json", help="输出JSON文件路径")
+    args = parser.parse_args()
+
+    parsed = parse_sim_log(args.log_path)
+    with open(args.output, 'w') as f:
+        json.dump(parsed, f, indent=2, ensure_ascii=False)
+    print(f"解析完成，结果已写入 {args.output}")
+
+if __name__ == "__main__":
+    main()
+	
+	
+使用说明
+单文件解析：python parse_sim_log.py simulation.log
+
+指定输出文件：python parse_sim_log.py simulation.log -o result.json
+
+代码集成：直接调用 parse_sim_log(log_path) 获得字典列表。
+
+关键特性
+多测试用例支持：自动按 ==== 分隔符拆分为独立块，每个块独立提取字段。
+
+健壮性：若缺失 Summary 行，则会实时统计 UVM_ERROR / UVM_WARNING 出现次数作为 error/warning count。
+
+双工具兼容：正则同时匹配 Simulation PASSED/FAILED (VCS) 和 TEST PASSED/FAILED (Xcelium)。
+
+结果逻辑：有明确 PASSED/FAILED 时直接采用；否则 error_count > 0 即判定为 FAIL。

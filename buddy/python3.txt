@@ -1,0 +1,291 @@
+The user wants me to implement a Python function `parse_sim_log(log_path: str) -> dict` that parses simulation log files. Let me break down the requirements:
+
+1. Extract fields: test_name, seed, start_time, error_count, warning_count, result (PASS/FAIL), elapsed_time_sec
+2. If no explicit "Simulation PASSED/FAILED", judge by error_count > 0
+3. Support multiple test cases in one log file (separated by "================")
+4. Use regex, don't hardcode line numbers
+5. Extra challenge: support both VCS and Xcelium formats
+6. Output to JSON file
+
+Let me write a comprehensive Python function.
+
+Since the user is in ask mode, I should provide the code as a code block for them to copy, not try to write it to a file.
+
+Let me think about the regex patterns needed:
+
+1. Test name pattern: `Test: (test_...)` or similar
+2. Seed pattern: `Seed: (\d+)`
+3. Start time: `Start time: (...)`
+4. UVM_ERROR count: `(\d+) error` or count UVM_ERROR lines
+5. UVM_WARNING count: `(\d+) warning` or count UVM_WARNING lines
+6. Result: `Simulation (PASSED|FAILED)` or `TEST (PASSED|FAILED)`
+7. Elapsed time: `Elapsed time: ([\d.]+) seconds`
+
+For multiple test cases, I need to split the log by the separator "================" and parse each section.
+
+Let me also think about Xcelium format:
+- Xcelium might use "TEST PASSED" or "TEST FAILED"
+- Might have different formats for error/warning counts
+
+I'll write a robust function that handles both.
+以下是可以直接使用的 Python 实现，支持 VCS / Xcelium 双格式，支持多测试用例串联解析，并输出 JSON 文件。
+
+---
+
+```python
+import re
+import json
+from pathlib import Path
+from typing import List, Dict, Optional
+
+
+def parse_sim_log(log_path: str) -> List[Dict]:
+    """
+    解析仿真 log 文件，返回结构化字典列表。
+
+    支持格式：
+      - VCS:  包含 'Simulation PASSED/FAILED' 或 UVM 日志
+      - Xcelium: 包含 'TEST PASSED/FAILED' 或 'TEST STATUS:'
+      - 多测试用例：以 '================' 或 '========================' 分隔
+
+    返回字段：
+      test_name, seed, start_time,
+      error_count, warning_count, fatal_count,
+      result (PASS/FAIL), elapsed_time_sec
+    """
+    log_path = Path(log_path)
+    if not log_path.exists():
+        raise FileNotFoundError(f"Log 文件不存在: {log_path}")
+
+    content = log_path.read_text(encoding="utf-8", errors="replace")
+
+    # ===== 1. 按分隔符拆分多个测试用例 =====
+    # 支持多种分隔线样式
+    separator_pattern = r'\n={40,}\n'
+    sections = re.split(separator_pattern, content)
+
+    results = []
+    for section in sections:
+        section = section.strip()
+        if not section:
+            continue
+
+        # 尝试从 section 中提取测试用例名，过滤无效块
+        test_name = _extract_test_name(section)
+        if test_name is None:
+            # 可能是无意义的碎片，跳过
+            continue
+
+        result = _parse_single_test(section, test_name)
+        if result:
+            results.append(result)
+
+    return results
+
+
+def _extract_test_name(section: str) -> Optional[str]:
+    """从日志片段中提取测试用例名"""
+    # 模式 1: "Test: test_xxx"
+    m = re.search(r'^Test:\s*(\S+)', section, re.MULTILINE)
+    if m:
+        return m.group(1)
+
+    # 模式 2: UVM_INFO 中的 TEST_NAME
+    m = re.search(r'UVM_TESTNAME\s*[=:]\s*(\S+)', section)
+    if m:
+        return m.group(1)
+
+    # 模式 3: Xcelium "TEST: test_xxx"
+    m = re.search(r'TEST:\s*(\S+)', section)
+    if m:
+        return m.group(1)
+
+    return None
+
+
+def _parse_single_test(section: str, test_name: str) -> Dict:
+    """解析单个测试用例的日志片段"""
+
+    result = {
+        "test_name": test_name,
+        "seed": None,
+        "start_time": None,
+        "error_count": 0,
+        "warning_count": 0,
+        "fatal_count": 0,
+        "result": "PASS",
+        "elapsed_time_sec": None,
+    }
+
+    # ===== seed =====
+    m = re.search(r'^Seed:\s*(\S+)', section, re.MULTILINE)
+    if m:
+        result["seed"] = m.group(1)
+    else:
+        # 尝试 +seed=xxxxx
+        m = re.search(r'[+@]seed[=:]?\s*(\d+)', section, re.IGNORECASE)
+        if m:
+            result["seed"] = m.group(1)
+
+    # ===== start_time =====
+    m = re.search(r'^Start time:\s*(.+)', section, re.MULTILINE)
+    if m:
+        result["start_time"] = m.group(1).strip()
+
+    # ===== 统计 UVM 行级计数（更可靠）=====
+    uvm_error_lines   = re.findall(r'\bUVM_ERROR\b', section)
+    uvm_warning_lines = re.findall(r'\bUVM_WARNING\b', section)
+    uvm_fatal_lines   = re.findall(r'\bUVM_FATAL\b', section)
+
+    result["error_count"]   = len(uvm_error_lines)
+    result["warning_count"] = len(uvm_warning_lines)
+    result["fatal_count"]   = len(uvm_fatal_lines)
+
+    # ===== 如果 Summary 行存在，以 Summary 为准（覆盖行级计数）=====
+    summary_patterns = [
+        r'Summary:\s*(\d+)\s*error',    # Summary: 1 error, 2 warnings
+        r'(\d+)\s*UVM_ERROR',           # 1 UVM_ERROR, 0 UVM_WARNING
+        r'Errors\s*=\s*(\d+)',          # Errors = 1
+        r'errors\s*:\s*(\d+)',          # errors: 1
+    ]
+    for pat in summary_patterns:
+        m = re.search(pat, section, re.IGNORECASE)
+        if m:
+            result["error_count"] = int(m.group(1))
+            break
+
+    warn_patterns = [
+        r'(\d+)\s*warning',
+        r'Warnings\s*=\s*(\d+)',
+        r'warnings\s*:\s*(\d+)',
+    ]
+    for pat in warn_patterns:
+        m = re.search(pat, section, re.IGNORECASE)
+        if m:
+            result["warning_count"] = int(m.group(1))
+            break
+
+    fatal_patterns = [
+        r'(\d+)\s*fatal',
+        r'Fatal\s*=\s*(\d+)',
+    ]
+    for pat in fatal_patterns:
+        m = re.search(pat, section, re.IGNORECASE)
+        if m:
+            result["fatal_count"] = int(m.group(1))
+            break
+
+    # ===== result: 优先解析显式标记 =====
+    result["result"] = _extract_result(section)
+
+    # ===== 兜底：error_count > 0 或 fatal_count > 0 → FAIL =====
+    if result["result"] == "PASS" and (result["error_count"] > 0 or result["fatal_count"] > 0):
+        result["result"] = "FAIL"
+
+    # ===== elapsed_time =====
+    time_patterns = [
+        r'Elapsed time:\s*([\d.]+)\s*seconds?',
+        r'Elapsed:\s*([\d.]+)\s*sec',
+        r'CPU\s+time\s*=\s*([\d.]+)\s*s',
+        r'Simulation\s+time\s*:\s*([\d.]+)\s*s',
+    ]
+    for pat in time_patterns:
+        m = re.search(pat, section, re.IGNORECASE)
+        if m:
+            result["elapsed_time_sec"] = float(m.group(1))
+            break
+
+    return result
+
+
+def _extract_result(section: str) -> str:
+    """
+    从日志中提取显式的 PASS/FAIL 标记。
+    支持 VCS 和 Xcelium 两种格式。
+    返回 'PASS', 'FAIL', 或 'PASS'（默认）。
+    """
+    # VCS 格式
+    m = re.search(r'Simulation\s+(PASSED|FAILED)', section, re.IGNORECASE)
+    if m:
+        return m.group(1).upper()
+
+    # Xcelium 格式
+    m = re.search(r'TEST\s+(PASSED|FAILED)', section, re.IGNORECASE)
+    if m:
+        return m.group(1).upper()
+
+    # Xcelium 另一种格式
+    m = re.search(r'TEST STATUS\s*:\s*(PASSED|FAILED)', section, re.IGNORECASE)
+    if m:
+        return m.group(1).upper()
+
+    # Questa / ModelSim 格式
+    m = re.search(r'\b(PASS|FAIL)\b', section)
+    if m:
+        return m.group(1).upper()
+
+    # 未找到显式标记，返回 PASS（由调用方根据 error_count 兜底判断）
+    return "PASS"
+
+
+def save_results_to_json(results: List[Dict], output_path: str) -> None:
+    """将解析结果写入 JSON 文件"""
+    Path(output_path).write_text(
+        json.dumps(results, indent=2, ensure_ascii=False),
+        encoding="utf-8"
+    )
+    print(f"✅ 结果已写入: {output_path}")
+
+
+# ========== 使用示例 ==========
+if __name__ == "__main__":
+    log_file = "sim.log"   # 替换为实际路径
+    output_file = "results.json"
+
+    results = parse_sim_log(log_file)
+    save_results_to_json(results, output_file)
+
+    # 打印摘要
+    for r in results:
+        status = "✅" if r["result"] == "PASS" else "❌"
+        print(f"{status} {r['test_name']:30s} | "
+              f"Result: {r['result']:6s} | "
+              f"Errors: {r['error_count']} | "
+              f"Warnings: {r['warning_count']} | "
+              f"Time: {r['elapsed_time_sec']}s")
+```
+
+---
+
+## 支持的 Log 格式汇总
+
+| 仿真器 | 结果判定行 | 正则模式 |
+|--------|-----------|---------|
+| **VCS** | `Simulation PASSED/FAILED` | `Simulation\s+(PASSED\|FAILED)` |
+| **Xcelium** | `TEST PASSED/FAILED` | `TEST\s+(PASSED\|FAILED)` |
+| **Xcelium** | `TEST STATUS : PASSED` | `TEST STATUS\s*:\s*(PASSED\|FAILED)` |
+| **Questa** | `PASS` / `FAIL` | `\b(PASS\|FAIL)\b` |
+| **兜底** | `error_count > 0` | 自动判定 FAIL |
+
+## 输出示例（`results.json`）
+
+```json
+[
+  {
+    "test_name": "test_apb_write_001",
+    "seed": "98765",
+    "start_time": "2025-01-15 10:23:45",
+    "error_count": 1,
+    "warning_count": 1,
+    "fatal_count": 0,
+    "result": "FAIL",
+    "elapsed_time_sec": 1.23
+  }
+]
+```
+
+## 多测试用例处理说明
+
+当 log 文件中存在多个用 `====================` 分隔的测试用例时，函数会自动拆分并逐段解析，返回 **字典列表**。如果只需单个字典，可以取 `results[0]`。
+
+如需进一步定制（例如支持更多仿真器格式），请告诉我！

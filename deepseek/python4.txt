@@ -1,0 +1,289 @@
+#!/usr/bin/env python3
+"""
+覆盖率合并与报告生成脚本
+功能：
+  1. 扫描目录下所有 .vdb 或 .imc 数据库
+  2. 调用 urg 或 imc 合并数据库并生成 XML 报告
+  3. 解析 XML 提取指定顶层模块及其所有子模块的行覆盖率与条件覆盖率
+  4. 输出 CSV 报告，条件覆盖率 < 90% 时打印警告
+"""
+
+import argparse
+import os
+import subprocess
+import sys
+import glob
+import csv
+import xml.etree.ElementTree as ET
+from typing import List, Dict, Optional, Tuple
+import re
+import logging
+
+# 设置日志
+logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
+logger = logging.getLogger(__name__)
+
+# 工具命令映射（可根据实际环境调整）
+TOOL_COMMANDS = {
+    'urg': {
+        'cmd': 'urg',
+        'args': ['-full64'],          # 基线参数
+        'merge': '-dir {dirs} -dbname {merged_db} -report {report_dir}',
+        'extra_merge': ['-norecurse'] # 可选的额外选项
+    },
+    'imc': {
+        'cmd': 'imc',
+        # imc 合并并生成报告通常需要 -exec 执行 Tcl 脚本
+        # 我们构造一个 Tcl 脚本来完成：合并、加载、生成 XML 报告
+        'exec': (
+            'merge -out {merged_db} -initial top -overwrite; '
+            'report -metric line -metric condition -hier -xml -out {xml_report}'
+        )
+    }
+}
+
+def find_tools():
+    """检测可用工具，返回工具名（urg 优先）"""
+    for tool in ['urg', 'imc']:
+        if subprocess.run(['which', tool], capture_output=True).returncode == 0:
+            return tool
+    return None
+
+def find_databases(search_dir: str, tool: str) -> List[str]:
+    """
+    在指定目录下递归查找覆盖率数据库。
+    urgs 查找 *.vdb 目录，imc 查找 *.imc 或 *.vdb 目录（Cadence 也可能用 .vdb）
+    """
+    patterns = ['**/*.vdb']
+    if tool == 'imc':
+        patterns.append('**/*.imc')
+    dbs = []
+    for pattern in patterns:
+        for path in glob.glob(os.path.join(search_dir, pattern), recursive=True):
+            if os.path.isdir(path):
+                dbs.append(os.path.abspath(path))
+    return sorted(dbs)
+
+def run_urg(databases: List[str], merged_db: str, report_dir: str, extra_opts: List[str] = None):
+    """调用 urg 合并并生成报告"""
+    cmd = ['urg'] + TOOL_COMMANDS['urg']['args']
+    if extra_opts:
+        cmd += extra_opts
+    dirs_arg = ' '.join(['-dir ' + db for db in databases])
+    cmd += ['-dbname', merged_db, '-report', report_dir]
+    # 添加 -norecurse 如果配置了
+    if '-norecurse' in (extra_opts or []) or '-norecurse' in TOOL_COMMANDS['urg']['extra_merge']:
+        cmd.append('-norecurse')
+    logger.info("执行 urg 合并命令: %s", ' '.join(cmd))
+    subprocess.run(cmd, check=True)
+
+def run_imc(databases: List[str], merged_db: str, report_dir: str):
+    """调用 imc 合并并生成 XML 报告"""
+    # 为 imc 创建报告目录
+    os.makedirs(report_dir, exist_ok=True)
+    xml_report = os.path.join(report_dir, 'coverage.xml')
+    # 构造 Tcl 脚本
+    tcl_script = f"""
+# 加载所有数据库（IMC 方式）
+foreach db {{ {' '.join(databases)} }} {{
+    open -database $db
+}}
+merge -out {merged_db} -initial top -overwrite
+# 切换到合并后的数据库（如果 imc 不支持直接写 -out，可能需要 load 合并后的数据库）
+# 实际操作中需要根据 imc 版本调整，这里给出一个通用模式
+report -metric line -metric condition -hier -xml -out {xml_report}
+exit
+"""
+    tcl_file = os.path.join(report_dir, 'imc_cmds.tcl')
+    with open(tcl_file, 'w') as f:
+        f.write(tcl_script)
+    cmd = ['imc', '-exec', f'source {tcl_file}']
+    logger.info("执行 imc 命令: %s", ' '.join(cmd))
+    subprocess.run(cmd, check=True)
+
+def find_latest_xml(report_dir: str) -> str:
+    """在 urg 生成的报告目录中查找覆盖率 XML 文件（通常位于子目录下）"""
+    for root, dirs, files in os.walk(report_dir):
+        for f in files:
+            if f.endswith('.xml') and ('coverage' in f.lower()):
+                return os.path.join(root, f)
+    # 如果没有找到，尝试直接找 *.xml
+    for root, dirs, files in os.walk(report_dir):
+        for f in files:
+            if f.endswith('.xml'):
+                return os.path.join(root, f)
+    raise FileNotFoundError(f"在 {report_dir} 中未找到 XML 报告文件")
+
+def parse_coverage_xml(xml_path: str, top_module: str) -> List[Dict]:
+    """
+    解析覆盖率 XML，提取 top 及其所有子模块的行/条件覆盖率。
+    返回列表，每项包含模块名、行覆盖率、条件覆盖率（百分比字符串）。
+    """
+    tree = ET.parse(xml_path)
+    root = tree.getroot()
+    # 查找所有 module 元素
+    # urg XML 结构通常为：<userCoverageReport><modules><module name="...">...
+    # imc 生成的 XML 可能类似，但结构可能不同，此处做兼容处理
+    modules = root.findall('.//module')
+    if not modules:
+        # 可能为 <coverageReport> 等其他根节点，尝试更宽松的搜索
+        modules = root.findall('.//*[@name]')  # 不推荐，但作为回退
+
+    results = []
+    top_prefix = top_module + '.'  # 用于匹配子模块
+
+    for mod in modules:
+        name = mod.get('name')
+        if name is None:
+            continue
+        # 只保留 top 模块本身以及以 top. 开头的子模块
+        if name == top_module or name.startswith(top_prefix):
+            metrics = mod.find('.//metrics') or mod.find('.//summary')  # 根据实际结构调整
+            if metrics is None:
+                # 尝试直接获取 line/condition 覆盖率属性
+                line_cov = mod.get('line_coverage') or mod.get('line')  # 可能百分比
+                cond_cov = mod.get('condition_coverage') or mod.get('condition')
+                if line_cov is None or cond_cov is None:
+                    continue
+            else:
+                line_cov = metrics.get('line') or metrics.get('line_coverage')
+                cond_cov = metrics.get('condition') or metrics.get('condition_coverage')
+                if line_cov is None or cond_cov is None:
+                    continue
+
+            # 清理百分比字符串
+            line_cov_str = line_cov.strip() if line_cov else 'N/A'
+            cond_cov_str = cond_cov.strip() if cond_cov else 'N/A'
+
+            results.append({
+                'module': name,
+                'line': line_cov_str,
+                'condition': cond_cov_str
+            })
+
+    # 排序：top 在第一位，其余按名称排序
+    results.sort(key=lambda x: (x['module'] != top_module, x['module']))
+    return results
+
+def write_csv(results: List[Dict], csv_path: str):
+    """将结果写入 CSV 文件"""
+    with open(csv_path, 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(['Module Name', 'Line Coverage', 'Condition Coverage'])
+        for r in results:
+            writer.writerow([r['module'], r['line'], r['condition']])
+    logger.info("CSV 报告已生成: %s", csv_path)
+
+def check_threshold(results: List[Dict], threshold: float = 90.0):
+    """检查条件覆盖率是否低于阈值并打印警告"""
+    for r in results:
+        cond_str = r['condition'].replace('%', '').strip()
+        try:
+            cond_val = float(cond_str)
+        except ValueError:
+            logger.warning("无法解析条件覆盖率值: %s", r['condition'])
+            continue
+        if cond_val < threshold:
+            logger.warning(
+                "模块 %s 的条件覆盖率 %.1f%% 低于 %.1f%% 阈值！", 
+                r['module'], cond_val, threshold
+            )
+
+def main():
+    parser = argparse.ArgumentParser(description='覆盖率合并与报告生成')
+    parser.add_argument('db_dir', help='包含覆盖率数据库的根目录')
+    parser.add_argument('--top', default='top', help='顶层模块名（默认: top）')
+    parser.add_argument('--csv', default='coverage_report.csv', help='输出 CSV 文件路径')
+    parser.add_argument('--report_dir', default='./merged_cov_report', help='临时报告目录')
+    parser.add_argument('--merged_db', default='./merged.vdb', help='合并后的数据库名（urg 有效）')
+    parser.add_argument('--extra_opts', nargs='*', default=['-norecurse'], 
+                        help='传递给合并命令的额外选项（如 -norecurse）')
+    parser.add_argument('--threshold', type=float, default=90.0, 
+                        help='条件覆盖率预警阈值（默认: 90.0）')
+    args = parser.parse_args()
+
+    # 1. 检测工具
+    tool = find_tools()
+    if not tool:
+        logger.error("未找到可用的覆盖率工具（urg 或 imc）")
+        sys.exit(1)
+    logger.info("使用工具: %s", tool)
+
+    # 2. 查找数据库
+    databases = find_databases(args.db_dir, tool)
+    if not databases:
+        logger.error("在 %s 中未找到覆盖率数据库（.vdb/.imc）", args.db_dir)
+        sys.exit(1)
+    logger.info("找到 %d 个数据库: %s", len(databases), databases)
+
+    # 3. 合并并生成报告
+    os.makedirs(args.report_dir, exist_ok=True)
+    if tool == 'urg':
+        run_urg(databases, args.merged_db, args.report_dir, args.extra_opts)
+    else:  # imc
+        run_imc(databases, args.merged_db, args.report_dir)
+
+    # 4. 查找生成的 XML 报告
+    xml_file = find_latest_xml(args.report_dir)
+    logger.info("解析 XML 报告: %s", xml_file)
+
+    # 5. 解析覆盖率
+    results = parse_coverage_xml(xml_file, args.top)
+    if not results:
+        logger.error("未提取到任何模块覆盖率信息，请检查顶层模块名和报告内容")
+        sys.exit(1)
+
+    # 6. 输出 CSV
+    write_csv(results, args.csv)
+
+    # 7. 条件覆盖率检查
+    check_threshold(results, args.threshold)
+
+    # 8. 打印汇总表
+    print("\n===== 覆盖率汇总 =====")
+    for r in results:
+        print(f"{r['module']:30s}  Line: {r['line']:>8s}  Condition: {r['condition']:>8s}")
+    print("========================\n")
+    logger.info("所有步骤完成。")
+
+if __name__ == '__main__':
+    main()
+	
+	
+	
+使用说明与扩展
+1. 环境依赖
+
+确认环境中 urg 或 imc 命令可用（运行脚本时会自动检测）。
+
+Python 3.6+，无需第三方库。
+
+2. 运行示例
+
+bash
+python merge_coverage.py cov_work --top top --csv coverage_top.csv --threshold 90
+cov_work 即包含多个 .vdb 子目录（如 test1.vdb, test2.vdb）的根目录。
+
+脚本会递归扫描所有 .vdb 或 .imc 目录，合并后生成报告。
+
+3. 如何支持不同报告格式
+
+urg：合并后默认会在 report_dir 下生成 urgReport/ 目录，内含 coverage.xml（或类似名称）。函数 find_latest_xml 会自动定位。
+
+imc：通过 Tcl 脚本生成指定名称的 XML 文件（coverage.xml），同样由 find_latest_xml 发现。
+
+若您的工具版本生成的 XML 结构不同，可修改 parse_coverage_xml 函数中的 XPath 路径及属性名。例如，某些 urg 版本中覆盖率百分比存储在 <metrics> 下，属性名为 lineCoverage，则需要相应调整。
+
+4. 额外选项与定制
+
+--extra_opts 允许传入任意合并参数，如 -norecurse 避免递归加载子模块（默认已带 -norecurse）。
+
+对于 imc，若需要更复杂的合并逻辑（如指定 scope），可修改脚本中 run_imc 的 Tcl 脚本内容。
+
+5. 错误处理
+
+若 XML 解析失败或模块名不匹配，脚本会输出错误并退出。
+
+工具执行失败会抛出异常并终止流程。
+
+此脚本已完整覆盖需求：自动工具选择、数据库合并、报告解析、CSV 输出与阈值报警，并具备良好的可配置性。

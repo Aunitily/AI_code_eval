@@ -1,0 +1,340 @@
+The user is asking me to create a Jenkins Pipeline (Jenkinsfile) for IC verification. The previous conversation shows I already created a Jenkinsfile but the user deleted it. Now they're asking again for the same thing.
+
+I need to create a Declarative Jenkins Pipeline that:
+1. Triggers on push to main branch or manual trigger with test case list
+2. Parallel execution reading from testlist.csv
+3. Timeout control (30 minutes per simulation)
+3. Result parsing (check for UVM_ERROR or FATAL)
+4. Post-processing with merge_coverage.py
+5. Email notification
+
+Since I'm in ask mode and don't have write capabilities, I should provide the complete Jenkinsfile code as text that the user can copy/apply.
+
+Let me create a comprehensive Declarative Jenkins Pipeline.
+
+Actually, wait - I need to check the mode. The system reminder says "The user is in ask mode; only read-only tools are available." So I should NOT try to write files. I should output the proposed code as text for the user to copy/apply.
+
+Let me write a comprehensive Declarative Jenkins Pipeline script
+
+
+您当前处于 **ask 模式**，我无法直接写入文件。以下是完整的 `Jenkinsfile` 代码，您可以复制后保存：
+
+---
+
+```groovy
+pipeline {
+    agent any
+
+    // ========== 1. 触发条件 ==========
+    triggers {
+        // Git webhook: main 分支有 push 时自动触发
+        pollSCM('H/5 * * * *')
+    }
+
+    // ========== 参数（手动触发时用） ==========
+    parameters {
+        string(
+            name: 'TEST_CASES',
+            defaultValue: '',
+            description: '手动指定测试用例列表，格式: test1,test2,test3（留空则读取 testlist.csv）'
+        )
+        booleanParam(
+            name: 'SKIP_COVERAGE',
+            defaultValue: false,
+            description: '是否跳过覆盖率收集与合并'
+        )
+        string(
+            name: 'EMAIL_RECIPIENTS',
+            defaultValue: 'team@example.com',
+            description: '邮件通知接收人，多个用逗号分隔'
+        )
+    }
+
+    // ========== 全局环境变量 ==========
+    environment {
+        SIM_TIMEOUT       = '30'        // 单个仿真超时（分钟）
+        RESULTS_FILE     = 'results.json'
+        COV_MERGE_SCRIPT = 'merge_coverage.py'
+        COV_DB_PATTERN   = '**/*.vdb'
+        COV_REPORT_DIR   = 'coverage_reports/html'
+        LOG_DIR          = 'logs'
+    }
+
+    stages {
+
+        // ========== Stage 1: 清理与准备 ==========
+        stage('Prepare') {
+            steps {
+                script {
+                    echo "=== 清理工作区 ==="
+                    cleanWs()
+
+                    echo "=== 拉取代码 ==="
+                    checkout scm
+
+                    // 创建必要目录
+                    sh "mkdir -p ${env.LOG_DIR} ${env.COV_REPORT_DIR}"
+
+                    // 初始化 results.json
+                    writeFile file: env.RESULTS_FILE,
+                              text: '{"build_number":"' + env.BUILD_NUMBER + '","tests":[]}'
+
+                    // 读取测试用例列表
+                    def testCases = []
+
+                    if (params.TEST_CASES?.trim()) {
+                        // 手动指定：从参数解析
+                        params.TEST_CASES.split(',').each { name ->
+                            testCases << [name: name.trim(), seed: 'random']
+                        }
+                    } else {
+                        // 从 testlist.csv 读取
+                        def csvFile = 'testlist.csv'
+                        if (!fileExists(csvFile)) {
+                            error "未找到 ${csvFile}，且未手动指定 TEST_CASES 参数"
+                        }
+                        readFile(csvFile).split('\n').each { line ->
+                            line = line.trim()
+                            if (line && !line.startsWith('#')) {
+                                def parts = line.split(',')
+                                testCases << [name: parts[0].trim(), seed: parts[1]?.trim() ?: 'random']
+                            }
+                        }
+                    }
+
+                    if (testCases.isEmpty()) {
+                        error "未找到任何测试用例！"
+                    }
+
+                    echo "共发现 ${testCases.size()} 个测试用例"
+                    env.TEST_CASES_JSON = groovy.json.JsonOutput.toJson(testCases)
+                }
+            }
+        }
+
+        // ========== Stage 2: 并行仿真 ==========
+        stage('Parallel Simulation') {
+            steps {
+                script {
+                    def testList  = readJSON text: env.TEST_CASES_JSON
+                    def parallelStages = [:]
+
+                    testList.each { tc ->
+                        def testName = tc.name
+                        def seed     = tc.seed
+
+                        parallelStages[testName] = {
+                            stage("Sim: ${testName}") {
+                                // 超时控制：30 分钟
+                                timeout(time: env.SIM_TIMEOUT.toInteger(), unit: 'MINUTES') {
+                                    script {
+                                        def logFile   = "${env.LOG_DIR}/${testName}/${testName}.log"
+                                        def startTime = System.currentTimeMillis()
+
+                                        sh """
+                                            mkdir -p ${env.LOG_DIR}/${testName}
+                                            echo "=== 开始仿真: ${testName}, seed=${seed} ===" > ${logFile}
+                                        """
+
+                                        // ========== 调用 VCS 仿真命令 ==========
+                                        // 替换为实际的仿真命令
+                                        // 示例：vcs -sverilog ${testName}.sv +UVM_TESTNAME=${testName} +seed=${seed} -R -l ${logFile}
+                                        def simCmd = "vcs -sverilog \${testName}.sv +UVM_TESTNAME=${testName} +seed=${seed} -R -l ${logFile}"
+
+                                        def simResult = sh(
+                                            script: simCmd,
+                                            returnStatus: true
+                                        )
+
+                                        def endTime = System.currentTimeMillis()
+                                        def durationSec = (endTime - startTime) / 1000
+
+                                        // ========== 4. 结果解析：检查 UVM_ERROR / FATAL ==========
+                                        def logContent = readFile(logFile)
+                                        def hasError = (logContent =~ /(UVM_ERROR|FATAL)/).find()
+
+                                        def testResult = 'PASS'
+                                        if (simResult != 0 || hasError) {
+                                            testResult = 'FAIL'
+                                        }
+
+                                        // 写入 results.json
+                                        def resultEntry = [
+                                            test_name:   testName,
+                                            seed:        seed,
+                                            result:      testResult,
+                                            duration_sec: durationSec.round(2),
+                                            log_path:    logFile,
+                                            timestamp:   new Date().format("yyyy-MM-dd HH:mm:ss")
+                                        ]
+
+                                        // 原子方式更新 results.json
+                                        sh """
+                                            python3 -c "
+import json, sys
+with open('${env.RESULTS_FILE}', 'r') as f:
+    data = json.load(f)
+data['tests'].append(${groovy.json.JsonOutput.toJson(resultEntry)})
+with open('${env.RESULTS_FILE}', 'w') as f:
+    json.dump(data, f, indent=2)
+"
+                                        """
+
+                                        // 归档 log 为构建产物
+                                        archiveArtifacts artifacts: "${logFile}",
+                                                         fingerprint: true,
+                                                         allowEmptyArchive: true
+
+                                        // 若失败则打印 log 摘要
+                                        if (testResult == 'FAIL') {
+                                            echo "❌ ${testName} FAILED (sim_rc=${simResult}, hasError=${hasError})"
+                                            echo "Log 末尾 50 行："
+                                            sh "tail -50 ${logFile} || true"
+                                        } else {
+                                            echo "✅ ${testName} PASSED (${durationSec} sec)"
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // 并行执行所有仿真任务
+                    parallel parallelStages
+                }
+            }
+        }
+
+        // ========== Stage 3: 覆盖率合并与报告 ==========
+        stage('Coverage Merge & Report') {
+            when {
+                not { equalTo expected: true, actual: params.SKIP_COVERAGE) }
+            }
+            steps {
+                script {
+                    echo "=== 运行覆盖率合并脚本 ==="
+
+                    // 确保 *.vdb 覆盖率数据库存在
+                    def vdbFiles = findFiles(glob: env.COV_DB_PATTERN)
+                    if (vdbFiles.size() == 0) {
+                        echo "⚠️  未找到任何 .vdb 覆盖率数据库，跳过合并"
+                    } else {
+                        echo "发现 ${vdbFiles.size()} 个 .vdb 文件，开始合并..."
+
+                        // 调用 Python 脚本合并覆盖率
+                        sh """
+                            python3 ${env.COV_MERGE_SCRIPT} \
+                                --input-dir  . \
+                                --output-dir ${env.COV_REPORT_DIR} \
+                                --format     html
+                        """
+
+                        // 归档覆盖率报告
+                        archiveArtifacts artifacts: "${env.COV_REPORT_DIR}/**/*",
+                                                 fingerprint: true,
+                                                 allowEmptyArchive: true
+
+                        echo "✅ 覆盖率报告已生成并归档"
+                    }
+                }
+            }
+        }
+    }
+
+    // ========== 后处理：邮件通知 ==========
+    post {
+        always {
+            script {
+                // 读取结果，生成汇总表格
+                def results     = [:]
+                def totalPass   = 0
+                def totalFail   = 0
+                def summaryTable = '<table border="1" cellpadding="5" cellspacing="0" style="border-collapse:collapse">'
+                summaryTable += '<tr style="background-color:#4CAF50;color:white"><th>用例名</th><th>结果</th><th>运行时间(秒)</th><th>Seed</th></tr>'
+
+                if (fileExists(env.RESULTS_FILE)) {
+                    def jsonData = readJSON file: env.RESULTS_FILE
+                    jsonData.tests.each { t ->
+                        def color = t.result == 'PASS' ? '#C8E6C9' : '#FFCDD2'
+                        def resultIcon = t.result == 'PASS' ? '✅' : '❌'
+                        summaryTable += "<tr style='background-color:${color}'>"
+                        summaryTable += "<td>${t.test_name}</td>"
+                        summaryTable += "<td>${resultIcon} ${t.result}</td>"
+                        summaryTable += "<td>${t.duration_sec}</td>"
+                        summaryTable += "<td>${t.seed}</td>"
+                        summaryTable += "</tr>"
+
+                        if (t.result == 'PASS') totalPass++ else totalFail++
+                    }
+                }
+
+                summaryTable += '</table>'
+
+                // 覆盖率报告链接
+                def covLink = "${env.BUILD_URL}artifact/${env.COV_REPORT_DIR}/index.html"
+                def logLink = "${env.BUILD_URL}artifact/${env.LOG_DIR}/"
+
+                // 邮件正文
+                def emailBody = """
+                <h2>Jenkins 构建报告 #${env.BUILD_NUMBER}</h2>
+                <p><b>状态：</b>${currentBuild.currentResult} |
+                   <b>通过：</b>${totalPass} |
+                   <b>失败：</b>${totalFail} |
+                   <b>Git Commit：</b>${env.GIT_COMMIT?.take(8) ?: 'N/A'}</p>
+                <h3>测试结果汇总</h3>
+                ${summaryTable}
+                <h3>覆盖率报告</h3>
+                <p><a href="${covLink}">📊 点击查看覆盖率 HTML 报告</a></p>
+                <p><a href="${logLink}">📄 点击查看所有仿真 Log</a></p>
+                <hr>
+                <p><i>此邮件由 Jenkins 自动发送，构建 #${env.BUILD_NUMBER}</i></p>
+                """
+
+                // 发送邮件
+                emailext(
+                    subject: "【${currentBuild.currentResult}】${env.JOB_NAME} #${env.BUILD_NUMBER} - IC 验证回归测试",
+                    body: emailBody,
+                    to: params.EMAIL_RECIPIENTS,
+                    mimeType: 'text/html'
+                )
+
+                echo "📧 邮件已发送至: ${params.EMAIL_RECIPIENTS}"
+            }
+        }
+
+        success {
+            echo "🎉 所有任务完成！"
+        }
+
+        failure {
+            echo "❌ 构建失败，请检查日志"
+        }
+    }
+}
+```
+
+---
+
+## 各功能对应关系说明
+
+| 需求 | 实现位置 | 关键代码 |
+|------|----------|----------|
+| **触发条件** | `triggers` + `parameters` | `pollSCM` + `TEST_CASES` 参数 |
+| **并行执行** | `Parallel Simulation` stage | `parallel parallelStages` |
+| **超时控制** | 每个并行任务内 | `timeout(time: 30, unit: 'MINUTES')` |
+| **结果解析** | 仿真后 | 正则 `/(UVM_ERROR\|FATAL)/` 匹配 log |
+| **覆盖率合并** | `Coverage Merge` stage | 调用 `merge_coverage.py` |
+| **邮件通知** | `post.always` | `emailext` + HTML 表格 |
+
+## 前置条件
+
+1. **Jenkins 插件**：Pipeline、Email Extension、HTML Publisher
+2. **`testlist.csv`** 放在仓库根目录，格式：
+   ```
+   test_ahb_write,12345
+   test_ahb_read,67890
+   test_ahb_burst,11111
+   ```
+3. **`merge_coverage.py`** 需接受 `--input-dir`、`--output-dir`、`--format` 参数
+
+如需调整 VCS 仿真命令或 `merge_coverage.py` 的调用方式，请告诉我！

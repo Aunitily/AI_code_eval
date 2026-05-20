@@ -1,0 +1,138 @@
+#!/usr/bin/env python3
+import argparse
+import datetime
+import os
+import re
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+
+def run_cmd(cmd, step_name):
+    """Run shell command and return process returncode."""
+    print(f"[INFO] Running {step_name}: {' '.join(cmd)}")
+    result = subprocess.run(cmd)
+    return result.returncode
+
+
+def has_error_in_log(log_file):
+    """Check if log contains keyword ERROR (case-insensitive)."""
+    path = Path(log_file)
+    if not path.exists():
+        print(f"[ERROR] Log file not found: {log_file}")
+        return True  # treat missing log as failure
+
+    pattern = re.compile(r"ERROR", re.IGNORECASE)
+    with path.open("r", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            if pattern.search(line):
+                return True
+    return False
+
+
+def archive_log(log_file, step_name, logs_dir):
+    """Move and rename log file to logs/{step}_{timestamp}.log."""
+    src = Path(log_file)
+    if not src.exists():
+        print(f"[WARN] Skip archiving missing log: {log_file}")
+        return None
+
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    dst = logs_dir / f"{step_name}_{timestamp}.log"
+    shutil.move(str(src), str(dst))
+    print(f"[INFO] Archived log: {dst}")
+    return dst
+
+
+def run_step(step_name, cmd, log_file, logs_dir):
+    """
+    Run one flow step:
+    1) execute command
+    2) check ERROR in log
+    3) archive log
+    Returns 0 on success, non-zero on failure.
+    """
+    rc = run_cmd(cmd, step_name)
+
+    error_found = has_error_in_log(log_file)
+    archived = archive_log(log_file, step_name, logs_dir)
+
+    if rc != 0:
+        print(f"[ERROR] {step_name} command failed with code {rc}")
+        return rc if rc != 0 else 1
+
+    if error_found:
+        print(f"[ERROR] Found 'ERROR' in {archived or log_file}, stop flow.")
+        return 1
+
+    print(f"[INFO] {step_name} passed.")
+    return 0
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Run RTL flow: lint -> synthesis -> simulation")
+    parser.add_argument("--top", required=True, help="Top module name")
+    parser.add_argument("--rtl_list", required=True, help="RTL file list path")
+    parser.add_argument("--syn", action="store_true", help="Enable synthesis (default: False)")
+    parser.add_argument("--sim", action="store_true", help="Enable simulation (default: False)")
+    args = parser.parse_args()
+
+    top = args.top
+    rtl_list = args.rtl_list
+
+    logs_dir = Path("./logs")
+    logs_dir.mkdir(parents=True, exist_ok=True)
+
+    # Step 1: Lint (always run)
+    lint_cmd = [
+        "spyglass", "-run", "lint",
+        "-top", top,
+        "-filelist", rtl_list,
+        "-log", "lint.log"
+    ]
+    rc = run_step("lint", lint_cmd, "lint.log", logs_dir)
+    if rc != 0:
+        sys.exit(rc)
+
+    # Step 2: Synthesis (optional)
+    if args.syn:
+        syn_cmd = [
+            "dc_shell",
+            "-f", "run_synthesis.tcl",
+            "-top", top,
+            "-rtl_list", rtl_list,
+            "-log", "syn.log"
+        ]
+        rc = run_step("syn", syn_cmd, "syn.log", logs_dir)
+        if rc != 0:
+            sys.exit(rc)
+
+    # Step 3: Simulation (optional)
+    if args.sim:
+        sim_cmd = [
+            "vcs",
+            "-f", rtl_list,
+            "-top", top,
+            "+define+SIM",
+            "-l", "sim.log"
+        ]
+        rc = run_step("sim", sim_cmd, "sim.log", logs_dir)
+        if rc != 0:
+            sys.exit(rc)
+
+    print("[INFO] Flow completed successfully.")
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()
+    
+使用方式
+python run_flow.py --top top_module --rtl_list rtl.f --syn --sim
+说明
+--syn / --sim 不写就是 False。
+执行顺序固定：lint -> syn(可选) -> sim(可选)。
+每一步执行后都会检查对应 log 是否含 ERROR（大小写不敏感），有则立即退出（非 0）。
+每个步骤的 log 都会移动到 ./logs/，并重命名为 {步骤名}_{时间戳}.log。
+你给的示例里 –sim 如果是中文输入法产生的长横线，记得改成标准 --sim。
